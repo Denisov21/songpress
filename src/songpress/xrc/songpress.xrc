@@ -56,11 +56,24 @@
 						<help>Create a karaoke-like PowerPoint presentation</help>
 					</object>
 				</object>
+				<object class="separator" />
+				<object class="wxMenuItem" name="print">
+					<label>_Print...\tCTRL+P</label>
+					<help>Print the song (chords + lyrics on left, lyrics only on right)</help>
+				</object>
+				<object class="wxMenuItem" name="printPreview">
+					<label>Print Pre_view...</label>
+					<help>Preview the song before printing</help>
+				</object>
+				<object class="wxMenuItem" name="pageSetup">
+					<label>Pa_ge setup...</label>
+					<help>Set paper size and orientation</help>
+				</object>
+				<object class="separator" />
 				<object class="wxMenuItem" name="exit">
 					<label>_Exit</label>
 					<help>Quit Songpress</help>
 				</object>
-				<object class="separator" />
 			</object>
 			<object class="wxMenu" name="edit">
 				<label>_Edit</label>

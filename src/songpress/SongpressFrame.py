@@ -185,6 +185,113 @@ else:
     ]
 
 
+class SongpressPrintout(wx.Printout):
+    """
+    Printout class for Songpress.
+    Renders the song exactly as shown in the preview panel,
+    respecting the paper size, orientation and margins chosen by the user.
+    """
+
+    def __init__(self, frame_obj, title="Song"):
+        wx.Printout.__init__(self, title)
+        self.frame_obj = frame_obj
+        # Copy margins at construction time (mm)
+        self._margin_top    = frame_obj._margin_top
+        self._margin_bottom = frame_obj._margin_bottom
+        self._margin_left   = frame_obj._margin_left
+        self._margin_right  = frame_obj._margin_right
+
+    def GetPageInfo(self):
+        return 1, 1, 1, 1  # minPage, maxPage, pageFrom, pageTo
+
+    def HasPage(self, page):
+        return page == 1
+
+    def OnPrintPage(self, page):
+        dc = self.GetDC()
+        self._render_page(dc)
+        return True
+
+    def _render_page(self, dc):
+        """
+        Render directly on the printer DC.
+
+        Strategy:
+          1. Measure the song on a screen MemoryDC (96 DPI) to get its natural
+             size in screen pixels.
+          2. Compute the scale that maps screen pixels -> printer device units,
+             taking into account:
+               a) the DPI ratio (printer PPI / screen PPI) - so fonts stay
+                  the same physical size on paper as on screen
+               b) a fit-to-page factor so the song fills the printable area
+                  without being clipped.
+          3. Apply that scale via SetUserScale and render once, directly on the
+             printer DC, so wxPython draws the fonts at the correct point size.
+        """
+        # --- Page geometry in printer device units ---
+        pw, ph = self.GetPageSizePixels()
+        printer_ppi_x, printer_ppi_y = dc.GetPPI()
+
+        # Margins in printer device units (from user settings, in mm)
+        def mm_to_du(mm, ppi):
+            return int(mm * ppi / 25.4)
+
+        margin_left   = mm_to_du(self._margin_left,   printer_ppi_x)
+        margin_right  = mm_to_du(self._margin_right,  printer_ppi_x)
+        margin_top    = mm_to_du(self._margin_top,    printer_ppi_y)
+        margin_bottom = mm_to_du(self._margin_bottom, printer_ppi_y)
+
+        usable_w = pw - margin_left - margin_right
+        usable_h = ph - margin_top  - margin_bottom
+
+        # --- Measure song on a screen DC ---
+        screen_ppi = 96  # standard screen DPI used by wx on most platforms
+        mdc = wx.MemoryDC(wx.Bitmap(1, 1))
+        decorator = (
+            self.frame_obj.pref.decorator
+            if self.frame_obj.pref.labelVerses
+            else SongDecorator()
+        )
+        fmt = self.frame_obj.pref.format
+        r = Renderer(fmt, decorator, self.frame_obj.pref.notations)
+
+        start, end = self.frame_obj.text.GetSelection()
+        song = self.frame_obj.text.GetText()
+        line_start = self.frame_obj.text.LineFromPosition(start)
+        line_end   = self.frame_obj.text.LineFromPosition(end)
+        if start == end:
+            sw, sh = r.Render(song, mdc)
+        else:
+            sw, sh = r.Render(song, mdc, line_start, line_end)
+        sw, sh = max(1, sw), max(1, sh)
+
+        # --- Compute scale ---
+        # Step 1: convert screen pixels to printer device units at 1:1 physical size
+        dpi_scale_x = printer_ppi_x / screen_ppi
+        dpi_scale_y = printer_ppi_y / screen_ppi
+        # Natural song size in printer units (same physical size as on screen)
+        natural_w = sw * dpi_scale_x
+        natural_h = sh * dpi_scale_y
+        # Step 2: shrink further if the song is wider or taller than the page
+        fit_scale = min(usable_w / natural_w, usable_h / natural_h, 1.0)
+        scale_x = dpi_scale_x * fit_scale
+        scale_y = dpi_scale_y * fit_scale
+
+        # --- Render directly on printer DC ---
+        # Centre horizontally, align to top margin
+        rendered_w = sw * scale_x
+        offset_x = margin_left + max(0, int((usable_w - rendered_w) / 2))
+        dc.SetDeviceOrigin(offset_x, margin_top)
+        dc.SetUserScale(scale_x, scale_y)
+        if start == end:
+            r.Render(song, dc)
+        else:
+            r.Render(song, dc, line_start, line_end)
+        # Reset transforms
+        dc.SetUserScale(1.0, 1.0)
+        dc.SetDeviceOrigin(0, 0)
+
+
 class SongpressFrame(SDIMainFrame):
     def __init__(self, res):
         SDIMainFrame.__init__(
@@ -314,6 +421,16 @@ class SongpressFrame(SDIMainFrame):
         if platform.system() != 'Windows':
             self.menuBar.GetMenu(0).FindItemById(self.exportMenuId).GetSubMenu().Delete(self.exportAsEmfMenuId)
         self.menuBar.GetMenu(6).Delete(self.donateMenuId)
+
+        # Persistent print settings (paper size, orientation, margins)
+        self._print_data = wx.PrintData()
+        self._print_data.SetPaperId(wx.PAPER_A4)
+        self._print_data.SetOrientation(wx.PORTRAIT)
+        # Margins in mm (top, bottom, left, right)
+        self._margin_top    = 15
+        self._margin_bottom = 15
+        self._margin_left   = 15
+        self._margin_right  = 15
         self.findReplaceDialog = None
         self.CheckLabelVerses()
         self.SetFont()
@@ -357,6 +474,9 @@ class SongpressFrame(SDIMainFrame):
         Bind(self.OnExportAsHtml, 'exportAsHtml')
         Bind(self.OnExportAsTab, 'exportAsTab')
         Bind(self.OnExportAsPptx, 'exportAsPptx')
+        Bind(self.OnPrint, 'print')
+        Bind(self.OnPrintPreview, 'printPreview')
+        Bind(self.OnPageSetup, 'pageSetup')
         Bind(self.OnUndo, 'undo')
         Bind(self.OnRedo, 'redo')
         Bind(self.OnCut, 'cut')
@@ -400,6 +520,24 @@ class SongpressFrame(SDIMainFrame):
         Bind(self.OnGuide, 'guide')
         Bind(self.OnNewsAndUpdates, 'newsAndUpdates')
         Bind(self.OnDonate, 'donate')
+        # --- NUOVO: Normalizza spazi multipli ---
+        Bind(self.OnNormalizeSpaces, 'normalizeSpaces')
+
+    def OnNormalizeSpaces(self, evt):
+        """
+        Replace multiple consecutive spaces with a single space
+        in the selected text or the whole text if nothing is selected.
+        """
+        import re
+        s, e = self.text.GetSelection()
+        if s == e:  # niente selezione: usa tutto il testo
+            text = self.text.GetText()
+            new_text = re.sub(r' {2,}', ' ', text)
+            self.text.SetText(new_text)
+        else:  # usa solo la selezione
+            text = self.text.GetTextRange(s, e)
+            new_text = re.sub(r' {2,}', ' ', text)
+            self.text.ReplaceSelection(new_text)
 
     def AddTool(self, toolbar, resource_string, icon_path, label, help):
         tool = wx.xrc.XRCID(resource_string)
@@ -910,6 +1048,61 @@ class SongpressFrame(SDIMainFrame):
             s += "{chordfont}{chordsize}{chordcolour}"
             self.InsertWithCaret(s)
 
+    def OnPageSetup(self, evt):
+        """Open the page setup dialog (paper size, orientation, margins)."""
+        data = wx.PageSetupDialogData(self._print_data)
+        data.SetMarginTopLeft(wx.Point(self._margin_left, self._margin_top))
+        data.SetMarginBottomRight(wx.Point(self._margin_right, self._margin_bottom))
+        dlg = wx.PageSetupDialog(self.frame, data)
+        if dlg.ShowModal() == wx.ID_OK:
+            result = dlg.GetPageSetupData()
+            self._print_data = wx.PrintData(result.GetPrintData())
+            tl = result.GetMarginTopLeft()
+            br = result.GetMarginBottomRight()
+            self._margin_left   = tl.x
+            self._margin_top    = tl.y
+            self._margin_right  = br.x
+            self._margin_bottom = br.y
+        dlg.Destroy()
+
+    def OnPrint(self, evt):
+        """Print the song exactly as shown in the preview."""
+        title = os.path.splitext(os.path.basename(self.document))[0] if self.document else _("Song")
+        pdd = wx.PrintDialogData(self._print_data)
+        printer = wx.Printer(pdd)
+        printout = SongpressPrintout(self, title)
+        if printer.Print(self.frame, printout, True):
+            # Save any settings the user may have changed in the print dialog
+            self._print_data = wx.PrintData(printer.GetPrintDialogData().GetPrintData())
+        else:
+            if printer.GetLastError() == wx.PRINTER_ERROR:
+                wx.MessageBox(
+                    _("An error occurred while printing.\nPlease check your printer settings."),
+                    _("Print error"),
+                    wx.OK | wx.ICON_ERROR,
+                    self.frame,
+                )
+        printout.Destroy()
+
+    def OnPrintPreview(self, evt):
+        """Show a print preview of the song."""
+        title = os.path.splitext(os.path.basename(self.document))[0] if self.document else _("Song")
+        printout1 = SongpressPrintout(self, title)
+        printout2 = SongpressPrintout(self, title)
+        preview = wx.PrintPreview(printout1, printout2, self._print_data)
+        if not preview.IsOk():
+            wx.MessageBox(
+                _("Could not create print preview.\nPlease check your printer settings."),
+                _("Print preview error"),
+                wx.OK | wx.ICON_ERROR,
+                self.frame,
+            )
+            return
+        pf = wx.PreviewFrame(preview, self.frame, _("Print Preview"))
+        pf.Initialize()
+        pf.SetSize(self.frame.GetSize())
+        pf.Show()
+
     def OnTranspose(self, evt):
         t = MyTransposeDialog(self.frame, self.pref.notations, self.text.GetTextOrSelection())
         if t.ShowModal() == wx.ID_OK:
@@ -1113,5 +1306,4 @@ class SongpressFrame(SDIMainFrame):
         else:
             self.previewCanvas.SetDecorator(SongDecorator())
         self.previewCanvas.Refresh(self.text.GetText())
-
 
