@@ -188,9 +188,13 @@ else:
 class SongpressPrintout(wx.Printout):
     """
     Printout class for Songpress.
-    Renders the song exactly as shown in the preview panel,
-    respecting the paper size, orientation and margins chosen by the user.
+    Renders the song across one or more pages, respecting paper size,
+    orientation and margins. Content is never scaled down: if the song is
+    taller than one page it flows onto subsequent pages automatically.
     """
+
+    # Standard screen DPI used by wx on most platforms
+    _SCREEN_PPI = 96
 
     def __init__(self, frame_obj, title="Song"):
         wx.Printout.__init__(self, title)
@@ -200,96 +204,160 @@ class SongpressPrintout(wx.Printout):
         self._margin_bottom = frame_obj._margin_bottom
         self._margin_left   = frame_obj._margin_left
         self._margin_right  = frame_obj._margin_right
+        # Page layout data – populated lazily on first use
+        self._page_offsets = None   # list of Y offsets (screen px) for each page
+        self._scale_x      = None
+        self._scale_y      = None
+        self._margin_du    = None   # (left, top, right, bottom) in device units
+        self._song_info    = None   # (song text, line_start, line_end, full_song)
+        self._usable_w_du  = None
 
-    def GetPageInfo(self):
-        return 1, 1, 1, 1  # minPage, maxPage, pageFrom, pageTo
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    def HasPage(self, page):
-        return page == 1
+    def _mm_to_du(self, mm, ppi):
+        return int(mm * ppi / 25.4)
 
-    def OnPrintPage(self, page):
-        dc = self.GetDC()
-        self._render_page(dc)
-        return True
-
-    def _render_page(self, dc):
+    def _ensure_layout(self, dc):
         """
-        Render directly on the printer DC.
-
-        Strategy:
-          1. Measure the song on a screen MemoryDC (96 DPI) to get its natural
-             size in screen pixels.
-          2. Compute the scale that maps screen pixels -> printer device units,
-             taking into account:
-               a) the DPI ratio (printer PPI / screen PPI) - so fonts stay
-                  the same physical size on paper as on screen
-               b) a fit-to-page factor so the song fills the printable area
-                  without being clipped.
-          3. Apply that scale via SetUserScale and render once, directly on the
-             printer DC, so wxPython draws the fonts at the correct point size.
+        Compute page layout (scales, margins, page break offsets) the first
+        time this is called; subsequent calls return immediately.
         """
-        # --- Page geometry in printer device units ---
+        if self._page_offsets is not None:
+            return
+
         pw, ph = self.GetPageSizePixels()
         printer_ppi_x, printer_ppi_y = dc.GetPPI()
 
-        # Margins in printer device units (from user settings, in mm)
-        def mm_to_du(mm, ppi):
-            return int(mm * ppi / 25.4)
+        ml = self._mm_to_du(self._margin_left,   printer_ppi_x)
+        mr = self._mm_to_du(self._margin_right,  printer_ppi_x)
+        mt = self._mm_to_du(self._margin_top,    printer_ppi_y)
+        mb = self._mm_to_du(self._margin_bottom, printer_ppi_y)
+        self._margin_du = (ml, mt, mr, mb)
 
-        margin_left   = mm_to_du(self._margin_left,   printer_ppi_x)
-        margin_right  = mm_to_du(self._margin_right,  printer_ppi_x)
-        margin_top    = mm_to_du(self._margin_top,    printer_ppi_y)
-        margin_bottom = mm_to_du(self._margin_bottom, printer_ppi_y)
+        usable_w = pw - ml - mr
+        usable_h = ph - mt - mb
+        self._usable_w_du = usable_w
 
-        usable_w = pw - margin_left - margin_right
-        usable_h = ph - margin_top  - margin_bottom
+        # DPI scale: map screen pixels to printer device units at 1:1 physical size
+        self._scale_x = printer_ppi_x / self._SCREEN_PPI
+        self._scale_y = printer_ppi_y / self._SCREEN_PPI
 
-        # --- Measure song on a screen DC ---
-        screen_ppi = 96  # standard screen DPI used by wx on most platforms
-        mdc = wx.MemoryDC(wx.Bitmap(1, 1))
+        # If the song is wider than the page, shrink horizontally only enough
+        # to fit in width (keep aspect ratio so height is also scaled).
+        # We never scale UP.
+        decorator = (
+            self.frame_obj.pref.decorator
+            if self.frame_obj.pref.labelVerses
+            else SongDecorator()
+        )
+        fmt  = self.frame_obj.pref.format
+        r    = Renderer(fmt, decorator, self.frame_obj.pref.notations)
+        mdc  = wx.MemoryDC(wx.Bitmap(1, 1))
+
+        start, end = self.frame_obj.text.GetSelection()
+        song        = self.frame_obj.text.GetText()
+        line_start  = self.frame_obj.text.LineFromPosition(start)
+        line_end    = self.frame_obj.text.LineFromPosition(end)
+        full_song   = (start == end)
+
+        if full_song:
+            sw, sh = r.Render(song, mdc)
+        else:
+            sw, sh = r.Render(song, mdc, line_start, line_end)
+        sw, sh = max(1, sw), max(1, sh)
+
+        self._song_info = (song, line_start, line_end, full_song)
+
+        # Natural song width in printer device units
+        natural_w = sw * self._scale_x
+        if natural_w > usable_w:
+            # Shrink proportionally to fit width
+            fit = usable_w / natural_w
+            self._scale_x *= fit
+            self._scale_y *= fit
+
+        # Height of the song in printer device units after scaling
+        song_h_du = sh * self._scale_y
+
+        # Compute page break offsets (in *screen pixels*) so that each page
+        # covers `usable_h` printer device units worth of content.
+        # usable_h / scale_y gives the number of screen pixels per page.
+        px_per_page = usable_h / self._scale_y
+        self._page_offsets = []
+        y = 0.0
+        while y < sh:
+            self._page_offsets.append(y)
+            y += px_per_page
+
+        if not self._page_offsets:
+            self._page_offsets = [0]
+
+    # ------------------------------------------------------------------
+    # wx.Printout interface
+    # ------------------------------------------------------------------
+
+    def GetPageInfo(self):
+        # We cannot call _ensure_layout here because we have no DC yet.
+        # Return a safe placeholder; wx will call OnPrintPage which will
+        # trigger layout.  We override this properly once layout is done.
+        n = len(self._page_offsets) if self._page_offsets else 1
+        return 1, n, 1, n
+
+    def HasPage(self, page):
+        n = len(self._page_offsets) if self._page_offsets else 1
+        return 1 <= page <= n
+
+    def OnPreparePrinting(self):
+        """Called before any page is printed – ideal place to do layout."""
+        dc = self.GetDC()
+        if dc:
+            self._ensure_layout(dc)
+
+    def OnPrintPage(self, page):
+        dc = self.GetDC()
+        self._ensure_layout(dc)
+
+        page_idx = page - 1
+        if page_idx >= len(self._page_offsets):
+            return False
+
+        ml, mt, mr, mb = self._margin_du
+        usable_w = self._usable_w_du
+        song, line_start, line_end, full_song = self._song_info
+        y_offset_px = self._page_offsets[page_idx]   # screen pixels to skip
+
+        # Centre content horizontally
+        # (song width in du = sw * scale_x, but we need sw from a quick measure)
+        # We just centre using usable_w – the renderer fills from x=0.
+        offset_x = ml   # left margin; centring is handled by the clipping region
+
+        # Set up clipping so content from adjacent pages doesn't bleed
+        dc.SetClippingRegion(ml, mt, usable_w, int(self.GetPageSizePixels()[1] - mt - mb))
+
+        # Shift origin: move up by y_offset in screen pixels * scale
+        dc.SetDeviceOrigin(offset_x, mt - int(y_offset_px * self._scale_y))
+        dc.SetUserScale(self._scale_x, self._scale_y)
+
         decorator = (
             self.frame_obj.pref.decorator
             if self.frame_obj.pref.labelVerses
             else SongDecorator()
         )
         fmt = self.frame_obj.pref.format
-        r = Renderer(fmt, decorator, self.frame_obj.pref.notations)
+        r   = Renderer(fmt, decorator, self.frame_obj.pref.notations)
 
-        start, end = self.frame_obj.text.GetSelection()
-        song = self.frame_obj.text.GetText()
-        line_start = self.frame_obj.text.LineFromPosition(start)
-        line_end   = self.frame_obj.text.LineFromPosition(end)
-        if start == end:
-            sw, sh = r.Render(song, mdc)
-        else:
-            sw, sh = r.Render(song, mdc, line_start, line_end)
-        sw, sh = max(1, sw), max(1, sh)
-
-        # --- Compute scale ---
-        # Step 1: convert screen pixels to printer device units at 1:1 physical size
-        dpi_scale_x = printer_ppi_x / screen_ppi
-        dpi_scale_y = printer_ppi_y / screen_ppi
-        # Natural song size in printer units (same physical size as on screen)
-        natural_w = sw * dpi_scale_x
-        natural_h = sh * dpi_scale_y
-        # Step 2: shrink further if the song is wider or taller than the page
-        fit_scale = min(usable_w / natural_w, usable_h / natural_h, 1.0)
-        scale_x = dpi_scale_x * fit_scale
-        scale_y = dpi_scale_y * fit_scale
-
-        # --- Render directly on printer DC ---
-        # Centre horizontally, align to top margin
-        rendered_w = sw * scale_x
-        offset_x = margin_left + max(0, int((usable_w - rendered_w) / 2))
-        dc.SetDeviceOrigin(offset_x, margin_top)
-        dc.SetUserScale(scale_x, scale_y)
-        if start == end:
+        if full_song:
             r.Render(song, dc)
         else:
             r.Render(song, dc, line_start, line_end)
-        # Reset transforms
+
+        # Reset transforms and clipping
         dc.SetUserScale(1.0, 1.0)
         dc.SetDeviceOrigin(0, 0)
+        dc.DestroyClippingRegion()
+        return True
 
 
 class SongpressFrame(SDIMainFrame):
@@ -417,11 +485,12 @@ class SongpressFrame(SDIMainFrame):
         self.noChordsMenuId = xrc.XRCID('noChords')
         self.oneVerseForEachChordPatternMenuId = xrc.XRCID('oneVerseForEachChordPattern')
         self.wholeSongMenuId = xrc.XRCID('wholeSong')
+        self.chordsAboveMenuId = xrc.XRCID('chordsAbove')
+        self.chordsBelowMenuId = xrc.XRCID('chordsBelow')
         self.donateMenuId = xrc.XRCID('donate')
         if platform.system() != 'Windows':
             self.menuBar.GetMenu(0).FindItemById(self.exportMenuId).GetSubMenu().Delete(self.exportAsEmfMenuId)
         self.menuBar.GetMenu(6).Delete(self.donateMenuId)
-
         # Persistent print settings (paper size, orientation, margins)
         self._print_data = wx.PrintData()
         self._print_data.SetPaperId(wx.PAPER_A4)
@@ -433,6 +502,7 @@ class SongpressFrame(SDIMainFrame):
         self._margin_right  = 15
         self.findReplaceDialog = None
         self.CheckLabelVerses()
+        self.CheckChordsPosition()
         self.SetFont()
         self.text.SetFont(self.pref.editorFace, self.pref.editorSize)
         self.FinalizePaneInitialization()
@@ -440,6 +510,7 @@ class SongpressFrame(SDIMainFrame):
         self._mgr.GetPane('preview').caption = _('Preview')
         self._mgr.GetPane('standard').caption = _('Standard')
         self._mgr.GetPane('format').caption = _('Format')
+        self.RestoreWindowGeometry()
         if 'firstTimeEasyKey' in self.pref.notices:
             msg = _(
                 "You are not a skilled guitarist? Songpress can help you: when you open a song, it can detect if chords are difficult. If this is the case, Songpress will alert you, and offer to transpose your song to the easiest key, automatically.\n\nDo you want to turn this option on?")
@@ -458,8 +529,63 @@ class SongpressFrame(SDIMainFrame):
         MyUpdateDialog.check_and_update(self.frame, self.pref)
 
     def OnClose(self, evt):
+        self.SaveWindowGeometry()
         self.config.Flush()
         super().OnClose(evt)
+
+    def SaveWindowGeometry(self):
+        """Save window size, position and maximized state to config."""
+        try:
+            maximized = self.frame.IsMaximized()
+            self.config.SetPath('/Window')
+            self.config.Write('maximized', '1' if maximized else '0')
+            if not maximized:
+                x, y = self.frame.GetPosition()
+                w, h = self.frame.GetSize()
+                self.config.Write('x', str(x))
+                self.config.Write('y', str(y))
+                self.config.Write('w', str(w))
+                self.config.Write('h', str(h))
+        except Exception:
+            pass
+
+    def RestoreWindowGeometry(self):
+        """Restore window size and position from config, with multimonitor safety."""
+        try:
+            self.config.SetPath('/Window')
+            maximized = self.config.Read('maximized')
+            x = self.config.Read('x')
+            y = self.config.Read('y')
+            w = self.config.Read('w')
+            h = self.config.Read('h')
+            if w and h:
+                w, h = int(w), int(h)
+                # Enforce minimum size
+                w = max(w, 400)
+                h = max(h, 300)
+                if x and y:
+                    x, y = int(x), int(y)
+                    # Verify that the saved position is visible on at least one connected display
+                    visible = False
+                    for i in range(wx.Display.GetCount()):
+                        display = wx.Display(i)
+                        client_rect = display.GetClientArea()
+                        # The window is considered visible if at least its top-left
+                        # 100x50 px area falls inside the display's client area
+                        if (client_rect.Contains(wx.Point(x + 100, y + 50)) or
+                                client_rect.Contains(wx.Point(x, y))):
+                            visible = True
+                            break
+                    if visible:
+                        self.frame.SetPosition(wx.Point(x, y))
+                    else:
+                        # Off-screen: centre on primary display
+                        self.frame.Centre()
+                self.frame.SetSize(wx.Size(w, h))
+            if maximized == '1':
+                self.frame.Maximize(True)
+        except Exception:
+            pass
 
     def BindMyMenu(self):
         """Bind a menu item, by xrc name, to a handler"""
@@ -510,6 +636,8 @@ class SongpressFrame(SDIMainFrame):
         Bind(self.OnNoChords, 'noChords')
         Bind(self.OnOneVerseForEachChordPattern, 'oneVerseForEachChordPattern')
         Bind(self.OnWholeSong, 'wholeSong')
+        Bind(self.OnChordsAbove, 'chordsAbove')
+        Bind(self.OnChordsBelow, 'chordsBelow')
         Bind(self.OnTranspose, 'transpose')
         Bind(self.OnSimplifyChords, 'simplifyChords')
         Bind(self.OnChangeChordNotation, 'changeChordNotation')
@@ -522,6 +650,15 @@ class SongpressFrame(SDIMainFrame):
         Bind(self.OnDonate, 'donate')
         # --- NUOVO: Normalizza spazi multipli ---
         Bind(self.OnNormalizeSpaces, 'normalizeSpaces')
+        # --- NUOVO: Formato => Altro ---
+        Bind(self.OnInsertLinespacing, 'insertLinespacing')
+        Bind(self.OnInsertChordtopspacing, 'insertChordtopspacing')
+        # --- NUOVO: Inserisci => Altro (blocchi strutturati) ---
+        Bind(self.OnInsertVerse, 'insertVerse')
+        Bind(self.OnInsertVerseNum, 'insertVerseNum')
+        Bind(self.OnInsertChorusBlock, 'insertChorusBlock')
+        Bind(self.OnInsertChordBlock, 'insertChordBlock')
+        Bind(self.OnInsertBridge, 'insertBridge')
 
     def OnNormalizeSpaces(self, evt):
         """
@@ -538,6 +675,72 @@ class SongpressFrame(SDIMainFrame):
             text = self.text.GetTextRange(s, e)
             new_text = re.sub(r' {2,}', ' ', text)
             self.text.ReplaceSelection(new_text)
+
+    def OnInsertLinespacing(self, evt):
+        """Inserisce la direttiva {linespacing: <valore>}."""
+        msg = _("Inserisci il valore dell'interlinea (es. 0 per rimuovere lo spazio extra):")
+        d = wx.TextEntryDialog(self.frame, msg, _("Interlinea"), "0")
+        if d.ShowModal() == wx.ID_OK:
+            val = d.GetValue().strip()
+            self.InsertWithCaret("{linespacing: %s}" % val)
+
+    def OnInsertChordtopspacing(self, evt):
+        """Inserisce la direttiva {chordtopspacing: <valore>}."""
+        msg = _("Inserisci il valore dello spazio sopra gli accordi (es. 0 per rimuovere lo spazio extra):")
+        d = wx.TextEntryDialog(self.frame, msg, _("Spazio sopra accordi"), "0")
+        if d.ShowModal() == wx.ID_OK:
+            val = d.GetValue().strip()
+            self.InsertWithCaret("{chordtopspacing: %s}" % val)
+
+    def OnInsertVerse(self, evt):
+        """Inserisce una strofa non numerata: {start_verse} ... {end_verse}"""
+        self.InsertWithCaret("{start_verse}\n|\n{end_verse}\n")
+
+    def OnInsertVerseNum(self, evt):
+        """Inserisce una strofa numerata: {start_verse_num} ... {end_verse_num}"""
+        self.InsertWithCaret("{start_verse_num}\n|\n{end_verse_num}\n")
+
+    def OnInsertChorusBlock(self, evt):
+        """Insert a chorus block: {start_chorus} ... {end_chorus}"""
+        default = self.pref.decoratorFormat.GetChorusLabel()
+        label = wx.GetTextFromUser(
+            _("Inserisci un'etichetta per il ritornello, o premi Annulla per omettere l'etichetta."),
+            _("Etichetta del ritornello"),
+            default,
+            self.frame,
+        )
+        if label == default or not label.strip():
+            self.InsertWithCaret("{start_chorus}\n|\n{end_chorus}\n")
+        else:
+            self.InsertWithCaret("{start_chorus:%s}\n|\n{end_chorus}\n" % label)
+
+    def OnInsertChordBlock(self, evt):
+        """Insert an intro chord block: {start_chord} ... {end_chord}"""
+        default = _("Intro")
+        label = wx.GetTextFromUser(
+            _("Inserisci un'etichetta per gli accordi di introduzione, o premi Annulla per usare '%s'.") % default,
+            _("Etichetta accordi introduzione"),
+            default,
+            self.frame,
+        )
+        if label.strip():
+            self.InsertWithCaret("{start_chord:%s}\n|\n{end_chord}\n" % label)
+        else:
+            self.InsertWithCaret("{start_chord}\n|\n{end_chord}\n")
+
+    def OnInsertBridge(self, evt):
+        """Insert a bridge block: {start_bridge} ... {end_bridge}"""
+        default = _("Bridge")
+        label = wx.GetTextFromUser(
+            _("Inserisci un'etichetta per l'inciso, o premi Annulla per usare '%s'.") % default,
+            _("Etichetta inciso"),
+            default,
+            self.frame,
+        )
+        if label.strip():
+            self.InsertWithCaret("{start_bridge:%s}\n|\n{end_bridge}\n" % label)
+        else:
+            self.InsertWithCaret("{start_bridge}\n|\n{end_bridge}\n")
 
     def AddTool(self, toolbar, resource_string, icon_path, label, help):
         tool = wx.xrc.XRCID(resource_string)
@@ -1100,7 +1303,85 @@ class SongpressFrame(SDIMainFrame):
             return
         pf = wx.PreviewFrame(preview, self.frame, _("Print Preview"))
         pf.Initialize()
+
+        # Rename the default "Print with icon" button to "Print..."
+        # and add a "Page setup..." button to the preview toolbar.
+        # wx.PreviewFrame exposes the control bar via GetControlBar() only
+        # after Initialize(); on some wxPython builds the method is missing,
+        # so we fall back to iterating child windows.
+        ctrl_bar = None
+        get_cb = getattr(pf, 'GetControlBar', None)
+        if get_cb is not None:
+            ctrl_bar = get_cb()
+        if ctrl_bar is None:
+            for child in pf.GetChildren():
+                if isinstance(child, wx.PreviewControlBar):
+                    ctrl_bar = child
+                    break
+
+        if ctrl_bar is not None:
+            # Rename the built-in wxWidgets buttons using our translation catalog.
+            # wx.PreviewControlBar sets these labels in English; we override them
+            # so they follow the active wx.Locale set by i18n.setLang().
+            #
+            # NOTE: wx.ID_PREVIEW_* constants are NOT exposed in wxPython, so we
+            # identify buttons by their current English label text instead.
+            # wx.ID_PRINT and wx.ID_CLOSE are standard wx constants and are safe.
+            _label_map = {
+                "Print":     _("Print..."),
+                "Print...":  _("Print..."),
+                "Next":      _("Next page"),
+                "Prev":      _("Previous page"),
+                "Previous":  _("Previous page"),
+                "First":     _("First page"),
+                "Last":      _("Last page"),
+                "Close":     _("Close"),
+            }
+            for child in ctrl_bar.GetChildren():
+                if isinstance(child, wx.Button):
+                    lbl = child.GetLabel().strip()
+                    if lbl in _label_map:
+                        child.SetLabel(_label_map[lbl])
+            # wx.ID_PRINT is a safe standard constant — rename directly too
+            # in case the button uses that ID but a non-standard label
+            btn_print = ctrl_bar.FindWindowById(wx.ID_PRINT)
+            if btn_print is not None:
+                btn_print.SetLabel(_("Print..."))
+
+            # Add a "Page setup..." button after a visual separator
+            _page_setup_id = wx.NewIdRef()
+            page_setup_btn = wx.Button(ctrl_bar, _page_setup_id, _("Page setup..."))
+            sizer = ctrl_bar.GetSizer()
+            if sizer is not None:
+                sizer.Add(wx.StaticLine(ctrl_bar, style=wx.LI_VERTICAL), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 4)
+                sizer.Add(page_setup_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2)
+                sizer.Layout()
+            else:
+                # Fallback: place button to the right of existing controls
+                cb_w, cb_h = ctrl_bar.GetSize()
+                btn_w, btn_h = page_setup_btn.GetBestSize()
+                page_setup_btn.SetSize(cb_w - btn_w - 8, (cb_h - btn_h) // 2, btn_w, btn_h)
+
+            def _on_preview_page_setup(evt, _pf=pf):
+                data = wx.PageSetupDialogData(self._print_data)
+                data.SetMarginTopLeft(wx.Point(self._margin_left, self._margin_top))
+                data.SetMarginBottomRight(wx.Point(self._margin_right, self._margin_bottom))
+                dlg = wx.PageSetupDialog(_pf, data)
+                if dlg.ShowModal() == wx.ID_OK:
+                    result = dlg.GetPageSetupData()
+                    self._print_data = wx.PrintData(result.GetPrintData())
+                    tl = result.GetMarginTopLeft()
+                    br = result.GetMarginBottomRight()
+                    self._margin_left   = tl.x
+                    self._margin_top    = tl.y
+                    self._margin_right  = br.x
+                    self._margin_bottom = br.y
+                dlg.Destroy()
+
+            pf.Bind(wx.EVT_BUTTON, _on_preview_page_setup, id=_page_setup_id)
+
         pf.SetSize(self.frame.GetSize())
+        pf.CentreOnScreen()
         pf.Show()
 
     def OnTranspose(self, evt):
@@ -1241,6 +1522,22 @@ class SongpressFrame(SDIMainFrame):
         self.pref.format.showChords = 2
         self.SetFont(True)
 
+    def OnChordsAbove(self, evt):
+        self.pref.SetChordsPosition('above')
+        self.CheckChordsPosition()
+        self.previewCanvas.Refresh(self.text.GetText())
+
+    def OnChordsBelow(self, evt):
+        self.pref.SetChordsPosition('below')
+        self.CheckChordsPosition()
+        self.previewCanvas.Refresh(self.text.GetText())
+
+    def CheckChordsPosition(self):
+        above = (self.pref.chordsPosition == 'above')
+        self.menuBar.Check(self.chordsAboveMenuId, above)
+        self.menuBar.Check(self.chordsBelowMenuId, not above)
+        self.previewCanvas.SetChordsBelow(not above)
+
     def OnTextChanged(self, evt):
         self.AutoAdjust(evt.lastPos, evt.currentPos)
 
@@ -1306,4 +1603,3 @@ class SongpressFrame(SDIMainFrame):
         else:
             self.previewCanvas.SetDecorator(SongDecorator())
         self.previewCanvas.Refresh(self.text.GetText())
-

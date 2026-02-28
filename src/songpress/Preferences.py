@@ -25,6 +25,13 @@ def get_update_frequencies():
         30: _("Month"),
         60: _("Two months"),
     }
+
+
+def get_chords_positions():
+    return {
+        'above': _("Above text"),
+        'below': _("Below text"),
+    }
     
 class Preferences(object):
     """
@@ -44,6 +51,7 @@ class Preferences(object):
         * autoAdjustSpuriousLines
         * autoAdjustTab2Chordpro
         * autoAdjustEasyKey
+        * chordsPosition ('above' or 'below')
         * locale
         * updateFrequency (days, or 0 for never)
         * ignoredUpdates
@@ -139,6 +147,11 @@ class Preferences(object):
         else:
             self.autoAdjustEasyKey = False
             self.notices['firstTimeEasyKey'] = True
+        chordsPosition = self.config.Read('chordsPosition')
+        if chordsPosition in ('above', 'below'):
+            self.chordsPosition = chordsPosition
+        else:
+            self.chordsPosition = 'above'
         self.config.SetPath('/AutoAdjust/EasyChordsGroups')
         for k in easyChordsOrder:
             l = self.config.Read(k)
@@ -201,6 +214,7 @@ class Preferences(object):
         self.config.Write('spuriousLines', self.Bool2String(self.autoAdjustSpuriousLines))
         self.config.Write('tab2chordpro', self.Bool2String(self.autoAdjustTab2Chordpro))
         self.config.Write('easyKey', self.Bool2String(self.autoAdjustEasyKey))
+        self.config.Write('chordsPosition', self.chordsPosition)
         self.config.SetPath('/AutoAdjust/EasyChordsGroups')
         for k in easyChordsOrder:
             self.config.Write(k, str(self.GetEasyChordsGroup(k)))
@@ -219,6 +233,11 @@ class Preferences(object):
     def SetChorusLabel(self, c):
         self.chorusLabel = c
         self.decoratorFormat.SetChorusLabel(c)
+
+    def SetChordsPosition(self, position):
+        """Set chords position: 'above' or 'below'."""
+        if position in ('above', 'below'):
+            self.chordsPosition = position
 
     def SetDefaultNotation(self, notation):
         self.defaultNotation = notation

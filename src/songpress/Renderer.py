@@ -16,6 +16,8 @@ from .SongBoxes import *
 from .Transpose import translateChord, autodetectNotation
 from .EditDistance import minEditDist
 
+_ = wx.GetTranslation
+
 
 class BreakException(Exception):
     pass
@@ -37,6 +39,7 @@ class Renderer(object):
         self.notation = None
         self.notations = notations
         self.chordPatterns = []
+        self.chordsBelow = False
 
     def BeginBlock(self, type, label=None):
         self.EndBlock()
@@ -98,7 +101,11 @@ class Renderer(object):
             and self.currentBlock.type == SongBlock.title
         ):
             self.EndBlock()
-        self.BeginVerse()
+        if type == SongText.comment and self.currentBlock is None:
+            self.BeginBlock(SongBlock.title)
+            self.format = self.sf.title
+        else:
+            self.BeginVerse()
         self.BeginLine()
         if type == SongText.comment:
             text = "(" + text + ")"
@@ -133,7 +140,8 @@ class Renderer(object):
 
     def EndLine(self):
         if self.currentLine is not None:
-            self.currentBlock.AddBox(self.currentLine)
+            if len(self.currentLine.boxes) > 0 or self.currentBlock.type != SongBlock.title:
+                self.currentBlock.AddBox(self.currentLine)
             self.currentLine = None
 
     def GetAttribute(self):
@@ -161,12 +169,13 @@ class Renderer(object):
         self.format = self.starting_sf
         self.currentLine = None
         self.currentBlock = None
-        self.song = SongSong(self.sf)
-        self.song.drawWholeSong = fromLine == -1
         self.lineCount = -1
         self.fromLine = fromLine
         self.toLine = toLine
         self.sf = SongFormat(self.starting_sf)
+        self.song = SongSong(self.sf)
+        self.song.drawWholeSong = fromLine == -1
+        self.song.chordsBelow = self.chordsBelow
         if self.sf.showChords == 1:
             self.notation = autodetectNotation(text, self.notations)
             self.chordPatterns = []
@@ -188,12 +197,53 @@ class Renderer(object):
                     cmd = tok.content.lower()
                     if cmd == 'soc' or cmd == 'start_of_chorus':
                         a = self.GetAttribute()
-                        self.BeginChorus(a)
+                        self.BeginChorus(a if (a and a.strip()) else None)
                     elif (cmd == 'eoc' or cmd == 'end_of_chorus') and state == SongBlock.chorus:
                         self.EndBlock()
+                    # --- Nuovi comandi strutturati ---
+                    elif cmd == 'start_verse':
+                        # Strofa non numerata: passa label="" (non-None) così
+                        # BeginBlock non incrementa labelCount e il decorator
+                        # non visualizza nessuna etichetta numerica.
+                        a = self.GetAttribute()
+                        label = a if (a and a.strip()) else ""
+                        self.BeginBlock(SongBlock.verse, label)
+                    elif cmd == 'end_verse':
+                        if state == SongBlock.verse:
+                            self.EndBlock()
+                    elif cmd == 'start_verse_num':
+                        # Strofa numerata: passa label=None per l'auto-numerazione
+                        a = self.GetAttribute()
+                        self.BeginBlock(SongBlock.verse, a if (a and a.strip()) else None)
+                    elif cmd == 'end_verse_num':
+                        if state == SongBlock.verse:
+                            self.EndBlock()
+                    elif cmd == 'start_chorus':
+                        a = self.GetAttribute()
+                        self.BeginChorus(a if (a and a.strip()) else None)
+                    elif cmd == 'end_chorus':
+                        if state == SongBlock.chorus:
+                            self.EndBlock()
+                    elif cmd == 'start_chord':
+                        # Introduzione accordi: etichetta fissa, non numerata
+                        a = self.GetAttribute()
+                        label = a if (a and a.strip()) else _("Intro")
+                        self.BeginBlock(SongBlock.verse, label)
+                    elif cmd == 'end_chord':
+                        if state == SongBlock.verse:
+                            self.EndBlock()
+                    elif cmd == 'start_bridge':
+                        # Inciso: etichetta fissa, non numerata
+                        a = self.GetAttribute()
+                        label = a.strip() if (a and a.strip()) else None
+                        self.BeginBlock(SongBlock.verse, label)
+                    elif cmd == 'end_bridge':
+                        if state == SongBlock.verse:
+                            self.EndBlock()
+                    # --- Fine nuovi comandi ---
                     elif cmd == 'c' or cmd == 'comment':
                         a = self.GetAttribute()
-                        if a is not None:
+                        if a is not None and a.strip() != '':
                             self.AddText(a, SongText.comment)
                     elif cmd == 't' or cmd == 'title':
                         a = self.GetAttribute()
@@ -309,6 +359,44 @@ class Renderer(object):
                             self.sf.chorus.chord.color = color
                         except BreakException:
                             pass
+                    elif cmd == 'chordtopspacing':
+                        try:
+                            a = self.GetAttribute()
+                            if a is None:
+                                spacing = self.starting_sf.chordTopSpacing
+                            else:
+                                a = a.strip()
+                                try:
+                                    spacing = int(a)
+                                except (TypeError, ValueError):
+                                    raise BreakException()
+                            self.format = ParagraphFormat(self.format)
+                            self.format.chordTopSpacing = spacing
+                            self.sf.chordTopSpacing = spacing
+                            self.sf.chorus.chordTopSpacing = spacing
+                            for v in self.sf.verse:
+                                v.chordTopSpacing = spacing
+                        except BreakException:
+                            pass
+                    elif cmd == 'linespacing':
+                        try:
+                            a = self.GetAttribute()
+                            if a is None:
+                                spacing = self.starting_sf.lineSpacing
+                            else:
+                                a = a.strip()
+                                try:
+                                    spacing = int(a)
+                                except (TypeError, ValueError):
+                                    raise BreakException()
+                            self.format = ParagraphFormat(self.format)
+                            self.format.lineSpacing = spacing
+                            self.sf.lineSpacing = spacing
+                            self.sf.chorus.lineSpacing = spacing
+                            for v in self.sf.verse:
+                                v.lineSpacing = spacing
+                        except BreakException:
+                            pass
 
             self.EndLine()
             if empty:
@@ -323,3 +411,6 @@ class Renderer(object):
 
     def SetDecorator(self, sd):
         self.sd = sd
+
+    def SetChordsBelow(self, below):
+        self.chordsBelow = below

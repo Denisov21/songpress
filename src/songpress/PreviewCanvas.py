@@ -59,3 +59,6 @@ class PreviewCanvas(object):
 
     def SetDecorator(self, sd):
         self.renderer.SetDecorator(sd)
+
+    def SetChordsBelow(self, below):
+        self.renderer.SetChordsBelow(below)

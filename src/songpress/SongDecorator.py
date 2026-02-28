@@ -67,20 +67,48 @@ class SongDecorator(object):
                 self.SetMarginText(t)
                 textMaxH = max(textMaxH, t.h)
                 textMaxTH = max(textMaxTH, t.GetTotalHeight())
+
+        chordsBelow = self.s.chordsBelow
+
         if chordsOnly and hasChords:
             textMaxH = 0
             textMaxTH = 0
             line.textBaseline = chordMaxTH
-        elif chordsOnly: # Block without text or chords
+            line.chordBaseline = chordMaxTH
+        elif chordsOnly:  # Block without text or chords
             w, h = self.dc.GetTextExtent(' ')
             textMaxH = h
             textMaxTH = h
             line.textBaseline = h
+            line.chordBaseline = chordMaxTH
         else:
-            line.textBaseline = chordMaxTH + chordMaxH * (line.parent.format.chordSpacing - 1) + textMaxTH
-        line.chordBaseline = chordMaxTH
-        
-        line.h = line.textBaseline + textMaxH * (line.parent.format.textSpacing - 1)
+            chord_top = line.parent.format.chordTopSpacing
+            if chordsBelow:
+                # Testo sopra, accordi sotto
+                line.textBaseline = textMaxTH
+                line.chordBaseline = (
+                    textMaxTH
+                    + textMaxH * (line.parent.format.textSpacing - 1)
+                    + chord_top
+                    + chordMaxTH
+                )
+            else:
+                # Accordi sopra (comportamento originale)
+                line.textBaseline = chord_top + chordMaxTH + chordMaxH * (line.parent.format.chordSpacing - 1) + textMaxTH
+                line.chordBaseline = chordMaxTH + chord_top
+
+        if chordsBelow and not (chordsOnly and hasChords) and not chordsOnly:
+            line.h = (
+                line.textBaseline
+                + textMaxH * (line.parent.format.textSpacing - 1)
+                + chord_top
+                + chordMaxH * (line.parent.format.chordSpacing - 1)
+                + chordMaxH
+                + line.parent.format.lineSpacing
+            )
+        else:
+            line.h = line.textBaseline + textMaxH * (line.parent.format.textSpacing - 1) + line.parent.format.lineSpacing
+
         # Pass 2: set layout
         x = 0
         chordX = 0
@@ -151,7 +179,18 @@ class SongDecorator(object):
         
     def PreDrawBlock(self, block, bx, by):
         # bx, by: coordinates of top-left corner of drawable area
-        pass
+        # Disegna rettangolo con linea sottile attorno all'etichetta della strofa
+        if block.label is not None:
+            self.dc.SetFont(block.format.wxFont)
+            lw, lh = self.dc.GetTextExtent(block.label)
+            padding = 3
+            x = int(bx + block.marginLeft) - padding
+            y = int(by + block.marginTop) - padding
+            w = lw + padding * 2
+            h = lh + padding * 2
+            self.dc.SetPen(wx.Pen(block.format.color, 1))
+            self.dc.SetBrush(wx.TRANSPARENT_BRUSH)
+            self.dc.DrawRectangle(x, y, w, h)
         
     def PreDrawLine(self, line, lx, ly):
         # lx, ly: coordinates of top-left corner of drawable area
@@ -169,7 +208,12 @@ class SongDecorator(object):
         
     def PostDrawText(self, text, tx, ty):
         # tx, ty: coordinates of top-left corner of drawable area
-        pass        
+        if text.type == SongText.title:
+            self.dc.SetPen(wx.Pen(text.color, 1)) #stabilisce spessore linea strofe e titolo
+            x1 = int(tx + text.marginLeft)
+            x2 = int(tx + text.marginLeft + text.w)
+            y = int(ty + text.marginTop + text.h)
+            self.dc.DrawLine(x1, y, x2, y)
         
     def PostDrawLine(self, line, lx, ly):
         # lx, ly: coordinates of top-left corner of drawable area

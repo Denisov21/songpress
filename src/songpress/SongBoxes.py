@@ -55,6 +55,7 @@ class SongSong(SongBox):
           self.chorusCount = 0
           self.labelCount = 0
           self.drawWholeSong = False
+          self.chordsBelow = False
 
 
 class SongBlock(SongBox):
